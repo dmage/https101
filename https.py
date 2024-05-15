@@ -672,11 +672,12 @@ def https_client(host, port):
     while len(buf) > 0:
         resp, buf = TLSPlaintext.unpack(buf)
         print()
+        note = ""
         if resp.content_type == ContentType.change_cipher_spec:
             decrypter = decrypt_server_fragment
         else:
             resp.decode_fragment(decrypter)
-        note = "(decrypted)" if decrypter else ""
+            note = "(decrypted)" if decrypter else ""
         print("<{} {}".format(note, resp))
 
     client_seq_num += 1
