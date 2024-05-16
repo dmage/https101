@@ -24,13 +24,15 @@ class Struct:
             if name not in self.__class__.__annotations__:
                 raise TypeError("Invalid field: {!r}".format(name))
             setattr(self, name, value)
-
-    def pack(self):
-        buf = b""
         for name, typ in self.__class__.__annotations__.items():
             value = getattr(self, name)
             if not isinstance(value, typ):
-                value = typ(value)
+                setattr(self, name, typ(value))
+
+    def pack(self):
+        buf = b""
+        for name, _ in self.__class__.__annotations__.items():
+            value = getattr(self, name)
             try:
                 packed_value = value.pack()
             except Exception as e:
@@ -40,29 +42,25 @@ class Struct:
 
     @classmethod
     def unpack(cls, buf):
-        instance = cls()
+        kwargs = {}
         for name, value in cls.__annotations__.items():
-            field, buf = value.unpack(buf)
-            setattr(instance, name, field)
-        return instance, buf
+            kwargs[name], buf = value.unpack(buf)
+        return cls(**kwargs), buf
 
     def __repr__(self):
         parts = []
-        for name, typ in self.__class__.__annotations__.items():
-            value = getattr(self, name)
-            if not isinstance(value, typ):
-                value = typ(value)
-            parts.append("{}={!r}".format(name, value))
+        for name, _ in self.__class__.__annotations__.items():
+            parts.append("{}={!r}".format(name, getattr(self, name)))
         return "{}({})".format(self.__class__.__name__, ", ".join(parts))
 
 
 class EnumMeta(type):
-    def __new__(cls, name, bases, dct):
-        typ = super().__new__(cls, name, bases, dct)
+    def __new__(metacls, name, bases, dct):
+        cls = super().__new__(metacls, name, bases, dct)
         for name, value in dct.items():
             if name[0] != "_":
-                setattr(typ, name, typ(value, name))
-        return typ
+                setattr(cls, name, cls(value, name))
+        return cls
 
 
 class Enum(metaclass=EnumMeta):
@@ -71,13 +69,10 @@ class Enum(metaclass=EnumMeta):
             super().__init__(value)
         self.value = value
         if name is None:
-            self.name = None
-            for name, v in self.__class__.__dict__.items():
-                if name[0] != "_" and v.value == value:
-                    self.name = name
-                    break
-        else:
-            self.name = name
+            for k, v in self.__class__.__dict__.items():
+                if k[0] != "_" and v.value == value:
+                    name = k
+        self.name = name
 
     def __repr__(self):
         if self.name is not None:
@@ -108,14 +103,13 @@ def uint(n):
         def __repr__(self):
             return repr(self.value)
 
-    Uint.__name__ = "Uint{}".format(n)
     return Uint
 
 
-def fixed_length(n):
+def fixed_length_string(n):
     assert n > 0, "n must be positive"
 
-    class FixedLength:
+    class FixedLengthString:
         def __init__(self, value):
             assert len(value) == n, "Value length is not {}".format(n)
             self.value = value
@@ -130,44 +124,17 @@ def fixed_length(n):
         def __repr__(self):
             return repr(self.value)
 
-    FixedLength.__name__ = "FixedLength{}".format(n)
-    return FixedLength
-
-
-def optional(element_type):
-    class Optional:
-        def __init__(self, value):
-            self.value = value
-
-        def pack(self):
-            if self.value is None:
-                return b""
-            if not isinstance(self.value, element_type):
-                self.value = element_type(self.value)
-            return self.value.pack()
-
-        @classmethod
-        def unpack(cls, buf):
-            if not buf:
-                return cls(None), buf
-            value, buf = element_type.unpack(buf)
-            return cls(value), buf
-
-        def __repr__(self):
-            return repr(self.value)
-
-    Optional.__name__ = "Optional{}".format(element_type.__name__)
-    return Optional
+    return FixedLengthString
 
 
 def variable_length(size_type, element_type):
     class VariableLength:
         def __init__(self, values):
-            self.values = values
+            self.value = values
 
         def pack(self):
             buf = b""
-            for value in self.values:
+            for value in self.value:
                 if not isinstance(value, element_type):
                     value = element_type(value)
                 try:
@@ -188,34 +155,34 @@ def variable_length(size_type, element_type):
             return cls(values), buf[length.value :]
 
         def __getitem__(self, key):
-            return self.values[key]
+            return self.value[key]
 
         def __len__(self):
-            return len(self.values)
+            return len(self.value)
 
         def __repr__(self):
-            return repr(self.values)
+            return repr(self.value)
 
         def __str__(self):
-            return str(self.values)
+            return str(self.value)
 
         def __iter__(self):
-            return iter(self.values)
+            return iter(self.value)
 
         def __contains__(self, value):
-            return value in self.values
+            return value in self.value
 
-    VariableLength.__name__ = "VariableLength{}{}".format(size_type.__name__, element_type.__name__)
     return VariableLength
 
 
 def variable_length_bytes(size_type):
     class VariableLengthBytes(variable_length(size_type, Uint8)):
-        def __init__(self, values):
-            self.values = values
+        def __init__(self, value):
+            assert isinstance(value, bytes), "Value must be bytes"
+            self.value = value
 
         def pack(self):
-            return size_type(len(self.values)).pack() + self.values
+            return size_type(len(self.value)).pack() + self.value
 
         @classmethod
         def unpack(cls, buf):
@@ -223,10 +190,36 @@ def variable_length_bytes(size_type):
             return cls(buf[: length.value]), buf[length.value :]
 
         def __repr__(self):
-            return self.values.hex()
+            if len(self.value) == 0:
+                return "''"
+            return self.value.hex()
 
-    VariableLengthBytes.__name__ = "VariableLengthBytes{}".format(size_type.__name__)
     return VariableLengthBytes
+
+
+def optional(element_type):
+    class Optional:
+        def __init__(self, value):
+            if value is not None and not isinstance(value, element_type):
+                value = element_type(value)
+            self.value = value
+
+        def pack(self):
+            if self.value is None:
+                return b""
+            return self.value.pack()
+
+        @classmethod
+        def unpack(cls, buf):
+            if not buf:
+                return cls(None), buf
+            value, buf = element_type.unpack(buf)
+            return cls(value), buf
+
+        def __repr__(self):
+            return repr(self.value)
+
+    return Optional
 
 
 Uint8 = uint(8)
@@ -234,14 +227,11 @@ Uint16 = uint(16)
 Uint24 = uint(24)
 Uint32 = uint(32)
 
-FixedLength2 = fixed_length(2)
-FixedLength28 = fixed_length(28)
-FixedLength46 = fixed_length(46)
 
 # RFC 5246 - 7.4 - Handshake Protocol
 
 
-class ProtocolVersion(Enum, FixedLength2):
+class ProtocolVersion(Enum, fixed_length_string(2)):
     TLS_1_2 = b"\x03\x03"
 
 
@@ -273,21 +263,16 @@ class HandshakeType(Enum, Uint8):
 
 class Random(Struct):
     gmt_unix_time: Uint32
-    random_bytes: FixedLength28
+    random_bytes: fixed_length_string(28)
 
 
-class SessionID(variable_length(Uint8, Uint8)):
+class SessionID(variable_length_bytes(Uint8)):
     def __init__(self, session_id):
         assert len(session_id) <= 32, "Session ID is too long"
-        if isinstance(session_id, bytes):
-            session_id = list(session_id)
         super().__init__(session_id)
 
-    def __repr__(self):
-        return "SessionID({})".format(repr(bytes(v.value for v in self.values)))
 
-
-class CipherSuite(Enum, FixedLength2):
+class CipherSuite(Enum, fixed_length_string(2)):
     TLS_NULL_WITH_NULL_NULL = b"\x00\x00"
     TLS_RSA_WITH_AES_256_CBC_SHA = b"\x00\x35"
     TLS_RSA_WITH_AES_256_CBC_SHA256 = b"\x00\x3d"
@@ -339,7 +324,7 @@ class ClientKeyExchange(Struct):
 
 class Certificate(variable_length(Uint24, Uint8)):
     def raw(self):
-        return bytes(v.value for v in self.values)
+        return bytes(v.value for v in self.value)
 
     def decoded(self):
         cert, rest = decoder.decode(self.raw(), asn1Spec=rfc2459.Certificate())
@@ -355,7 +340,7 @@ class Certificate(variable_length(Uint24, Uint8)):
 
 class CertificateList(variable_length(Uint24, Certificate)):
     def __repr__(self):
-        return "CertificateList({})".format(repr(self.values))
+        return "CertificateList({})".format(repr(self.value))
 
 
 class Handshake:
@@ -391,20 +376,26 @@ class Handshake:
 
 class PreMasterSecret(Struct):
     client_version: ProtocolVersion
-    random: FixedLength46
+    random: fixed_length_string(46)
 
 
 # RFC 5246 - 6.2 - Record Layer
 
+class Fragment(variable_length_bytes(Uint16)):
+    pass
 
-class TLSPlaintext:
+class TLSPlaintext(Struct):
+    content_type: ContentType
+    protocol_version: ProtocolVersion
+    fragment: Fragment
+
     def __init__(self, content_type, protocol_version, fragment):
         self.content_type = content_type
         self.protocol_version = protocol_version
         self.fragment = fragment
 
     def decode_fragment(self, decrypt=None):
-        if isinstance(self.fragment, bytes):
+        if isinstance(self.fragment, Fragment):
             data = self.fragment
             if decrypt is not None:
                 data = decrypt(data)
@@ -419,23 +410,9 @@ class TLSPlaintext:
         return self.fragment
 
     def pack(self):
-        fragment = self.fragment
-        if not isinstance(fragment, bytes):
-            fragment = fragment.pack()
-        assert len(fragment) <= 2**14, "Fragment size is too large"
-        return struct.pack("!B2sH", self.content_type.value, self.protocol_version.value, len(fragment)) + fragment
-
-    @staticmethod
-    def unpack(buf):
-        content_type, protocol_version, length = struct.unpack("!B2sH", buf[:5])
-        fragment = buf[5 : 5 + length]
-        return (
-            TLSPlaintext(ContentType(content_type), ProtocolVersion(protocol_version), fragment),
-            buf[5 + length :],
-        )
-
-    def __repr__(self):
-        return "TLSPlaintext(content_type={!r}, protocol_version={!r}, fragment={!r})".format(self.content_type, self.protocol_version, self.fragment)
+        if not isinstance(self.fragment, Fragment):
+            return TLSPlaintext(self.content_type, self.protocol_version, Fragment(self.fragment.pack())).pack()
+        return super().pack()
 
 
 # Client
@@ -538,7 +515,7 @@ def https_client(host, port):
     while len(buf) > 0:
         resp, buf = TLSPlaintext.unpack(buf)
         if resp.content_type == ContentType.handshake:
-            handshake_messages += resp.fragment
+            handshake_messages += resp.fragment.value
         resp.decode_fragment()
         print()
         print("< {}".format(resp))
@@ -548,7 +525,7 @@ def https_client(host, port):
                 resp.fragment.body.cipher_suite == CipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA
             ), "Only RSA with AES-256-CBC is supported, got {!r}".format(resp.fragment.body.cipher_suite)
         if isinstance(resp.fragment.body, CertificateList):
-            cert = resp.fragment.body.values[0].decoded()
+            cert = resp.fragment.body.value[0].decoded()
             publicKey = public_key_from_certificate(cert)
             modulus = int(publicKey.getComponentByName("modulus"))
             publicExponent = int(publicKey.getComponentByName("publicExponent"))
@@ -608,7 +585,7 @@ def https_client(host, port):
     if keylogfile:
         keylogfile.write("CLIENT_RANDOM {} {}\n".format(client_random.pack().hex(), master_secret.hex()))
 
-    change_cipher_spec = TLSPlaintext(ContentType.change_cipher_spec, ProtocolVersion.TLS_1_2, b"\x01")
+    change_cipher_spec = TLSPlaintext(ContentType.change_cipher_spec, ProtocolVersion.TLS_1_2, Fragment(b"\x01"))
     print()
     print("> {}".format(change_cipher_spec))
     s.send(change_cipher_spec.pack())
@@ -660,7 +637,7 @@ def https_client(host, port):
         padding_length = decrypted[-1] + 1
         return decrypted[: -padding_length - mac_length]
 
-    finished = TLSPlaintext(ContentType.handshake, ProtocolVersion.TLS_1_2, block)
+    finished = TLSPlaintext(ContentType.handshake, ProtocolVersion.TLS_1_2, Fragment(block))
 
     print()
     print("> {}".format(finished))
@@ -685,7 +662,7 @@ def https_client(host, port):
     encrypt_cipher = AES.new(client_write_key, AES.MODE_CBC, client_iv)
     req = "GET / HTTP/1.1\r\nHost: {}\r\n\r\n".format(host).encode("utf-8")
     block = client_iv + encrypt_cipher.encrypt(create_block(ContentType.application_data, req))
-    req = TLSPlaintext(ContentType.application_data, ProtocolVersion.TLS_1_2, block)
+    req = TLSPlaintext(ContentType.application_data, ProtocolVersion.TLS_1_2, Fragment(block))
     print()
     print("> {}".format(req))
     s.send(req.pack())
